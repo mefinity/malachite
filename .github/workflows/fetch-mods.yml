@@ -1,0 +1,49 @@
+name: Fetch Geode Mods
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch-mods:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Restore ETag cache
+        uses: actions/cache@v4
+        with:
+          path: .etags
+          key: etag-cache-${{ github.run_id }}
+          restore-keys: |
+            etag-cache-
+
+      - name: Run fetch script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          chmod +x fetch_mod_json.sh
+          ./fetch_mod_json.sh
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add mods.json
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update mods.json [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+            git push
+          fi
