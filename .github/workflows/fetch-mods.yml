@@ -27,12 +27,189 @@ jobs:
           restore-keys: |
             etag-cache-
 
-      - name: Run fetch script
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+      - name: Fetch mods from Geode API
         run: |
-          chmod +x fetch_mod_json.sh
-          ./fetch_mod_json.sh
+          set -euo pipefail
+          
+          OUTPUT="mods.json"
+          TOKEN="${{ secrets.GH_PAT }}"
+          ETAG_DIR=".etags"
+          
+          mkdir -p "$ETAG_DIR"
+          
+          log() {
+              echo "$*" >&2
+          }
+          
+          curl_api() {
+              local URL="$1"
+              local ETAG_FILE="$ETAG_DIR/$(echo "$URL" | md5sum | cut -d' ' -f1).etag"
+              local ETAG_HEADER=""
+              
+              if [ -f "$ETAG_FILE" ]; then
+                  ETAG_HEADER="-H \"If-None-Match: $(cat "$ETAG_FILE")\""
+              fi
+              
+              local RESPONSE_FILE
+              RESPONSE_FILE=$(mktemp)
+              local HEADER_FILE
+              HEADER_FILE=$(mktemp)
+              
+              local CURL_CMD="curl -s -D \"$HEADER_FILE\" -o \"$RESPONSE_FILE\""
+              [ -n "$TOKEN" ] && CURL_CMD="$CURL_CMD -H \"Authorization: token $TOKEN\""
+              [ -n "$ETAG_HEADER" ] && CURL_CMD="$CURL_CMD $ETAG_HEADER"
+              CURL_CMD="$CURL_CMD \"$URL\""
+              
+              eval "$CURL_CMD"
+              
+              local STATUS
+              STATUS=$(grep -i "^HTTP" "$HEADER_FILE" | tail -1 | awk '{print $2}')
+              
+              if [ "$STATUS" = "304" ]; then
+                  rm -f "$RESPONSE_FILE" "$HEADER_FILE"
+                  echo "__NOT_MODIFIED__"
+                  return 0
+              fi
+              
+              local NEW_ETAG
+              NEW_ETAG=$(grep -i "^etag:" "$HEADER_FILE" | tail -1 | awk '{print $2}' | tr -d '\r')
+              if [ -n "$NEW_ETAG" ]; then
+                  echo "$NEW_ETAG" > "$ETAG_FILE"
+              fi
+              
+              cat "$RESPONSE_FILE"
+              rm -f "$RESPONSE_FILE" "$HEADER_FILE"
+          }
+          
+          # Fetch repos from Geode API
+          REPOS=()
+          for PAGE in {1..7}; do
+              log "Fetching page $PAGE from the Geode API..."
+              API_URL="https://api.geode-sdk.org/v1/mods?gd=2.2074&per_page=100&page=$PAGE"
+              RESPONSE=$(curl -s "$API_URL")
+              
+              ERROR=$(echo "$RESPONSE" | jq -r '.error // empty')
+              if [ -n "$ERROR" ]; then
+                  log "Error on page $PAGE: $ERROR"
+                  continue
+              fi
+          
+              mapfile -t PAGE_REPOS < <(echo "$RESPONSE" | jq -r '.payload.data[] | select(.links.source != null or .repository != null) | (.links.source // .repository) | select(contains("github.com")) | sub("https://github.com/"; "")')
+              
+              if [ ${#PAGE_REPOS[@]} -eq 0 ]; then
+                  break
+              fi
+              REPOS+=("${PAGE_REPOS[@]}")
+          done
+          
+          mapfile -t REPOS < <(printf '%s\n' "${REPOS[@]}" | sort -u)
+          log "Fetching ${#REPOS[@]} GitHub repos..."
+          
+          fetch_and_check() {
+              local OWNER_REPO="$1"
+              
+              local BRANCHES_JSON
+              BRANCHES_JSON=$(curl_api "https://api.github.com/repos/$OWNER_REPO/branches")
+              
+              if [ "$BRANCHES_JSON" = "__NOT_MODIFIED__" ]; then
+                  return 1
+              fi
+              
+              if echo "$BRANCHES_JSON" | jq -e '.message' > /dev/null 2>&1; then
+                  return 1
+              fi
+          
+              local THRESHOLD_DATE
+              THRESHOLD_DATE=$(date -u -d '30 days ago' +%s)
+              local ACTIVE_BRANCHES=()
+              
+              while read -r BRANCH; do
+                  [ -z "$BRANCH" ] && continue
+                  
+                  local COMMIT_JSON
+                  COMMIT_JSON=$(curl_api "https://api.github.com/repos/$OWNER_REPO/commits/$BRANCH")
+                  
+                  [ "$COMMIT_JSON" = "__NOT_MODIFIED__" ] && continue
+                  
+                  local COMMIT_DATE
+                  COMMIT_DATE=$(echo "$COMMIT_JSON" | jq -r '.commit.author.date // empty')
+                  
+                  [ -z "$COMMIT_DATE" ] && continue
+          
+                  local COMMIT_TS
+                  COMMIT_TS=$(date -u -d "$COMMIT_DATE" +%s)
+          
+                  if [ "$COMMIT_TS" -ge "$THRESHOLD_DATE" ]; then
+                      ACTIVE_BRANCHES+=("$COMMIT_TS $BRANCH")
+                  fi
+              done < <(echo "$BRANCHES_JSON" | jq -r '.[].name')
+          
+              [ ${#ACTIVE_BRANCHES[@]} -eq 0 ] && return 1
+          
+              local SORTED_BRANCHES
+              SORTED_BRANCHES=$(printf "%s\n" "${ACTIVE_BRANCHES[@]}" | sort -rn)
+              
+              while read -r LINE; do
+                  [ -z "$LINE" ] && continue
+                  
+                  local BRANCH
+                  BRANCH=$(echo "$LINE" | cut -d' ' -f2-)
+                  
+                  local MOD_URL="https://api.github.com/repos/$OWNER_REPO/contents/mod.json?ref=$BRANCH"
+                  local RESPONSE
+                  RESPONSE=$(curl_api "$MOD_URL")
+                  
+                  [ "$RESPONSE" = "__NOT_MODIFIED__" ] && continue
+          
+                  if echo "$RESPONSE" | jq -e '.message' > /dev/null 2>&1; then
+                      continue
+                  fi
+                  
+                  local CONTENT
+                  CONTENT=$(echo "$RESPONSE" | jq -r '.content' | base64 -d 2>/dev/null) || continue
+                  [ -z "$CONTENT" ] && continue
+          
+                  if echo "$CONTENT" | jq -e '.geode == "5.0.0-alpha.1"' > /dev/null 2>&1; then
+                      echo "$CONTENT" | jq --arg branch "$BRANCH" '{id, name, developer: (if .developer then .developer elif (.developers | type == "array") then (.developers | join(", ")) else null end), description, links, tags, branch: $branch}'
+                      return 0
+                  fi
+              done <<< "$SORTED_BRANCHES"
+              
+              return 1
+          }
+          
+          TMP_DIR=$(mktemp -d)
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          
+          MAX_JOBS=4
+          for REPO in "${REPOS[@]}"; do
+              while [ "$(jobs -r | wc -l)" -ge "$MAX_JOBS" ]; do
+                  wait -n
+              done
+              (
+                  RESULT=$(fetch_and_check "$REPO") || true
+                  if [ -n "$RESULT" ]; then
+                      echo "$RESULT" > "$TMP_DIR/${REPO//\//_}.json"
+                      log "(OK) [$REPO] - Found 5.0.0 mod.json file"
+                  else
+                      log "(SKIP) [$REPO]: No correct mod.json file found."
+                  fi
+              ) &
+          done
+          
+          wait
+          
+          if compgen -G "$TMP_DIR/*.json" > /dev/null; then
+              TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              jq -s ". += [{\"last_updated\": \"$TIMESTAMP\"}]" "$TMP_DIR"/*.json | jq -c '.' > "$OUTPUT"
+              SUCCESS_COUNT=$(find "$TMP_DIR" -name "*.json" | wc -l)
+          else
+              TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              echo "[{\"last_updated\": \"$TIMESTAMP\"}]" | jq -c '.' > "$OUTPUT"
+              SUCCESS_COUNT=0
+          fi
+          
+          log "Done. Saved $SUCCESS_COUNT mods to $OUTPUT"
 
       - name: Commit and push changes
         run: |
