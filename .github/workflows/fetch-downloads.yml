@@ -1,0 +1,128 @@
+name: Fetch Mod Downloads
+
+on:
+  schedule:
+    - cron: '0 */7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch-downloads:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq curl python3
+
+      - name: Fetch mod downloads
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          
+          INPUT="mods.json"
+          OUTPUT="mods.downloadUrl.json"
+          TOKEN="${GH_PAT:-}"
+          MAX_JOBS=3
+          
+          log() { echo "$*" >&2; }
+          
+          urlencode() {
+              python3 -c "import urllib.parse; print(urllib.parse.quote('$1', safe=''))" 2>/dev/null || echo "$1" | sed 's/ /%20/g'
+          }
+          
+          curl_api() {
+              if [ -n "$TOKEN" ]; then
+                  curl -s -H "Authorization: token $TOKEN" "$1"
+              else
+                  curl -s "$1"
+              fi
+          }
+          
+          fetch_download() {
+              local mod_id="$1" repo="$2" tmp_dir="$3"
+              local releases url run_id artifacts name
+              
+              releases=$(curl_api "https://api.github.com/repos/$repo/releases?per_page=20")
+              if ! echo "$releases" | jq -e '.message' &>/dev/null; then
+                  url=$(echo "$releases" | jq -r '
+                      [.[] | select(.prerelease == true or (.tag_name | ascii_downcase | test("beta|alpha|dev|nightly|rc|pre")))] |
+                      first | .assets[]? | select(.name | test("\\.geode$")) | .browser_download_url
+                  ' | head -1)
+                  if [ -n "$url" ] && [ "$url" != "null" ]; then
+                      echo "{\"id\": \"$mod_id\", \"download\": \"$url\"}" > "$tmp_dir/${mod_id}.json"
+                      log "  [RELEASE] $mod_id"
+                      return 0
+                  fi
+              fi
+              
+              runs=$(curl_api "https://api.github.com/repos/$repo/actions/runs?status=success&per_page=5")
+              if ! echo "$runs" | jq -e '.message' &>/dev/null; then
+                  run_id=$(echo "$runs" | jq -r '.workflow_runs[0].id // empty')
+                  if [ -n "$run_id" ]; then
+                      artifacts=$(curl_api "https://api.github.com/repos/$repo/actions/runs/$run_id/artifacts")
+                      if ! echo "$artifacts" | jq -e '.message' &>/dev/null; then
+                          name=$(echo "$artifacts" | jq -r '.artifacts | (map(select(.name | ascii_downcase | test("geode|build|release"))) | first) // first | .name // empty')
+                          if [ -n "$name" ]; then
+                              url="https://nightly.link/$repo/actions/runs/$run_id/$(urlencode "$name").zip"
+                              echo "{\"id\": \"$mod_id\", \"download\": \"$url\"}" > "$tmp_dir/${mod_id}.json"
+                              log "  [ARTIFACT] $mod_id"
+                              return 0
+                          fi
+                      fi
+                  fi
+              fi
+              
+              log "  [ABSENT] $mod_id"
+              return 1
+          }
+          
+          [ ! -f "$INPUT" ] && log "Error: $INPUT not found" && exit 1
+          
+          log "Fetching beta downloads (parallel: $MAX_JOBS)..."
+          
+          TMP_DIR=$(mktemp -d)
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          
+          mods=$(jq -r '.[] | select(.links.source != null) | select(.links.source | contains("github.com")) | "\(.id)|\(.links.source | sub("https://github.com/"; "") | sub("\\.git$"; "") | sub("/$"; ""))"' "$INPUT")
+          
+          total=0
+          while IFS='|' read -r mod_id repo; do
+              [ -z "$mod_id" ] && continue
+              ((total++)) || true
+              
+              while [ "$(jobs -r | wc -l)" -ge "$MAX_JOBS" ]; do wait -n; done
+              fetch_download "$mod_id" "$repo" "$TMP_DIR" || true &
+          done <<< "$mods"
+          
+          wait
+          
+          if compgen -G "$TMP_DIR/*.json" > /dev/null; then
+              TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              jq -s ". += [{\"last_updated\": \"$TIMESTAMP\"}]" "$TMP_DIR"/*.json | jq -c '.' > "$OUTPUT"
+              found=$(find "$TMP_DIR" -name "*.json" | wc -l)
+              log "Done! $found/$total mods saved to $OUTPUT"
+          else
+              TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              echo "[{\"last_updated\": \"$TIMESTAMP\"}]" | jq -c '.' > "$OUTPUT"
+              log "Done! 0/$total mods found"
+          fi
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add mods.downloadUrl.json
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update mods.downloadUrl.json [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+            git push
+          fi
