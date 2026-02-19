@@ -81,7 +81,6 @@ jobs:
               rm -f "$RESPONSE_FILE" "$HEADER_FILE"
           }
           
-          # Fetch repos from Geode API
           REPOS=()
           for PAGE in {1..7}; do
               log "Fetching page $PAGE from the Geode API..."
@@ -169,8 +168,9 @@ jobs:
                   CONTENT=$(echo "$RESPONSE" | jq -r '.content' | base64 -d 2>/dev/null) || continue
                   [ -z "$CONTENT" ] && continue
           
-                  if echo "$CONTENT" | jq -e '.geode == "5.0.0-beta.2"' > /dev/null 2>&1; then
-                      echo "$CONTENT" | jq --arg branch "$BRANCH" '{id, name, developer: (if .developer then .developer elif (.developers | type == "array") then (.developers | join(", ")) else null end), description, links, tags, branch: $branch}'
+                  GEODE_VER=$(echo "$CONTENT" | jq -r '.geode // empty')
+                  if [[ "$GEODE_VER" =~ ^5\.0\.0-beta\.[123]$ ]]; then
+                      echo "$CONTENT" | jq --arg branch "$BRANCH" --arg ver "$GEODE_VER" '{id, name, developer: (if .developer then .developer elif (.developers | type == "array") then (.developers | join(", ")) else null end), description, links, tags, version: $ver, branch: $branch}'
                       return 0
                   fi
               done <<< "$SORTED_BRANCHES"
