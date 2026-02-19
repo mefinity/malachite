@@ -169,7 +169,7 @@ jobs:
                   CONTENT=$(echo "$RESPONSE" | jq -r '.content' | base64 -d 2>/dev/null) || continue
                   [ -z "$CONTENT" ] && continue
           
-                  if echo "$CONTENT" | jq -e '.geode == "5.0.0-alpha.1"' > /dev/null 2>&1; then
+                  if echo "$CONTENT" | jq -e '.geode == "5.0.0-beta.2"' > /dev/null 2>&1; then
                       echo "$CONTENT" | jq --arg branch "$BRANCH" '{id, name, developer: (if .developer then .developer elif (.developers | type == "array") then (.developers | join(", ")) else null end), description, links, tags, branch: $branch}'
                       return 0
                   fi
