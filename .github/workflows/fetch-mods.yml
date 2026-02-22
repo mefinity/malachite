@@ -169,7 +169,7 @@ jobs:
                   [ -z "$CONTENT" ] && continue
           
                   GEODE_VER=$(echo "$CONTENT" | jq -r '.geode // empty')
-                  if [[ "$GEODE_VER" =~ ^5\.0\.0-beta\.[123]$ ]]; then
+                  if [[ "$GEODE_VER" =~ ^5\.0\.0-beta\.[1234]$ ]]; then
                       echo "$CONTENT" | jq --arg branch "$BRANCH" --arg ver "$GEODE_VER" '{id, name, developer: (if .developer then .developer elif (.developers | type == "array") then (.developers | join(", ")) else null end), description, links, tags, version: $ver, branch: $branch}'
                       return 0
                   fi
