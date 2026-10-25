@@ -81,6 +81,7 @@ jobs:
               rm -f "$RESPONSE_FILE" "$HEADER_FILE"
           }
           
+          TARGET_GD="2.2091"
           REPOS=()
           for PAGE in {1..12}; do
               log "Fetching page $PAGE from the Geode API..."
