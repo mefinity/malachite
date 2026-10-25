@@ -23,9 +23,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .etags
-          key: etag-cache-${{ github.run_id }}
+          key: etag-cache-v2-${{ github.run_id }}
           restore-keys: |
-            etag-cache-
+            etag-cache-v2-
 
       - name: Fetch mods from Geode API
         run: |
@@ -40,13 +40,38 @@ jobs:
           log() {
               echo "$*" >&2
           }
+
+          PREV_DIR=""
+          if [ -f "$OUTPUT" ]; then
+              PREV_DIR=$(mktemp -d)
+              jq -c '.[] | select(.id != null)' "$OUTPUT" 2>/dev/null | while IFS= read -r ENTRY; do
+                  SRC=$(printf '%s' "$ENTRY" | jq -r '.links.source // empty')
+                  [ -z "$SRC" ] && continue
+                  KEY=$(printf '%s' "$SRC" | sed -e 's#^https://github\.com/##' -e 's#/$##' -e 's#\.git$##' | tr '/' '_')
+                  [ -z "$KEY" ] && continue
+                  printf '%s\n' "$ENTRY" > "$PREV_DIR/$KEY.json"
+              done
+          fi
+          
+          prev_entry() {
+              local KEY="${1//\//_}"
+              local BRANCH="$2"
+              local FILE="$PREV_DIR/$KEY.json"
+              
+              [ -n "$PREV_DIR" ] || return 1
+              [ -f "$FILE" ] || return 1
+              [ "$(jq -r '.branch // empty' "$FILE")" = "$BRANCH" ] || return 1
+              
+              cat "$FILE"
+          }
           
           curl_api() {
               local URL="$1"
+              local USE_ETAG="${2:-yes}"
               local ETAG_FILE="$ETAG_DIR/$(echo "$URL" | md5sum | cut -d' ' -f1).etag"
               local ETAG_HEADER=""
               
-              if [ -f "$ETAG_FILE" ]; then
+              if [ "$USE_ETAG" = "yes" ] && [ -f "$ETAG_FILE" ]; then
                   ETAG_HEADER="-H \"If-None-Match: $(cat "$ETAG_FILE")\""
               fi
               
@@ -109,7 +134,7 @@ jobs:
               local OWNER_REPO="$1"
               
               local BRANCHES_JSON
-              BRANCHES_JSON=$(curl_api "https://api.github.com/repos/$OWNER_REPO/branches")
+              BRANCHES_JSON=$(curl_api "https://api.github.com/repos/$OWNER_REPO/branches" no)
               
               if [ "$BRANCHES_JSON" = "__NOT_MODIFIED__" ]; then
                   return 1
@@ -129,7 +154,10 @@ jobs:
                   local COMMIT_JSON
                   COMMIT_JSON=$(curl_api "https://api.github.com/repos/$OWNER_REPO/commits/$BRANCH")
                   
-                  [ "$COMMIT_JSON" = "__NOT_MODIFIED__" ] && continue
+                  if [ "$COMMIT_JSON" = "__NOT_MODIFIED__" ]; then
+                      prev_entry "$OWNER_REPO" "$BRANCH" && return 0
+                      continue
+                  fi
                   
                   local COMMIT_DATE
                   COMMIT_DATE=$(echo "$COMMIT_JSON" | jq -r '.commit.author.date // empty')
@@ -159,7 +187,10 @@ jobs:
                   local RESPONSE
                   RESPONSE=$(curl_api "$MOD_URL")
                   
-                  [ "$RESPONSE" = "__NOT_MODIFIED__" ] && continue
+                  if [ "$RESPONSE" = "__NOT_MODIFIED__" ]; then
+                      prev_entry "$OWNER_REPO" "$BRANCH" && return 0
+                      continue
+                  fi
           
                   if echo "$RESPONSE" | jq -e '.message' > /dev/null 2>&1; then
                       continue
@@ -188,7 +219,7 @@ jobs:
           }
           
           TMP_DIR=$(mktemp -d)
-          trap 'rm -rf "$TMP_DIR"' EXIT
+          trap 'rm -rf "$TMP_DIR" ${PREV_DIR:+"$PREV_DIR"}' EXIT
           
           MAX_JOBS=4
           for REPO in "${REPOS[@]}"; do
